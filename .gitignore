@@ -1,0 +1,321 @@
+# ============================================================================
+# Python PyTrends API - .gitignore
+# ============================================================================
+
+# ============================================================================
+# Python Environment
+# ============================================================================
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv/
+virtualenv/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / Packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ============================================================================
+# Environment Variables & Secrets
+# ============================================================================
+
+# Environment files
+.env
+.env.local
+.env.*.local
+.env.production
+
+# Secret keys
+secrets.txt
+*.key
+*.pem
+*.cert
+
+# ============================================================================
+# Application Logs
+# ============================================================================
+
+# Log files
+*.log
+logs/
+*.log.*
+error.log
+access.log
+passenger.log
+
+# Firebase debug
+firebase-debug.log
+firestore-debug.log
+
+# ============================================================================
+# Cache & Temporary Files
+# ============================================================================
+
+# Application cache
+cache/
+*.cache
+.cache/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Session files
+*.session
+
+# ============================================================================
+# Development & Testing
+# ============================================================================
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# ============================================================================
+# IDE & Editor Files
+# ============================================================================
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iml
+*.iws
+.idea_modules/
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# ============================================================================
+# Operating System Files
+# ============================================================================
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# Linux
+.directory
+.Trash-*
+.nfs*
+
+# ============================================================================
+# cPanel Specific
+# ============================================================================
+
+# Passenger restart file
+tmp/restart.txt
+
+# cPanel temp files
+.cpanel/
+.htpasswds/
+.lastlogin
+.trash/
+
+# cPanel error documents (keep custom ones, ignore defaults)
+# error_docs/
+
+# ============================================================================
+# Database Files
+# ============================================================================
+
+# SQLite
+*.db
+*.sqlite
+*.sqlite3
+
+# Redis dumps
+dump.rdb
+
+# ============================================================================
+# Backup Files
+# ============================================================================
+
+# Backup files
+*.bak
+*.backup
+*.old
+*_backup
+*_old
+backup/
+
+# Old implementation (already created)
+pytrends_api_old.py
+
+# ============================================================================
+# Documentation (Optional - uncomment if you don't want to track docs)
+# ============================================================================
+
+# Uncomment these if you don't want documentation in Git
+# *.md
+# !README.md
+
+# ============================================================================
+# Large Files & Data
+# ============================================================================
+
+# Data files
+*.csv
+*.json
+*.xml
+data/
+datasets/
+
+# Exclude large files (>100MB)
+*.zip
+*.tar.gz
+*.rar
+*.7z
+
+# ============================================================================
+# Security & Configuration (Production-specific)
+# ============================================================================
+
+# Production configuration (DO NOT COMMIT)
+config.production.py
+settings.production.py
+
+# SSL Certificates (never commit these!)
+*.crt
+*.ca-bundle
+ssl/
+
+# ============================================================================
+# Deployment Files (Keep local only)
+# ============================================================================
+
+# Deployment scripts (optional - uncomment if you don't want to share)
+# deploy.sh
+# deploy.ps1
+
+# Local deployment config
+deployment.local.yml
+deploy.local.json
+
+# ============================================================================
+# Test & Development Only Files
+# ============================================================================
+
+# Temporary test scripts
+tmp_rovodev_*
+test_*.tmp
+scratch.py
+playground.py
+
+# ============================================================================
+# Node Modules (if you add any frontend tools)
+# ============================================================================
+
+# node_modules/
+# package-lock.json
+# yarn.lock
+
+# ============================================================================
+# Notes
+# ============================================================================
+
+# This .gitignore is configured for a Python FastAPI application
+# deployed on cPanel with Passenger.
+#
+# IMPORTANT FILES TO KEEP IN GIT:
+# - pytrends_api.py (main application)
+# - cache_manager.py (caching logic)
+# - requirements.txt (dependencies)
+# - passenger_wsgi.py (cPanel deployment)
+# - htaccess (Apache config)
+# - README.md (documentation)
+# - DEPLOYMENT.md (deployment guide)
+#
+# NEVER COMMIT:
+# - .env files with secret keys
+# - Log files
+# - Virtual environment (venv/)
+# - Cache directories
+# - SSL certificates
+# - Production configuration with secrets

@@ -1,0 +1,901 @@
+"""
+Google Trends API - Comprehensive Edition
+Production-ready FastAPI service with caching, all endpoints, and comprehensive research capability
+"""
+
+from fastapi import FastAPI, Request, HTTPException, Depends, status, Query, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pytrends.request import TrendReq
+from pydantic import BaseModel, Field, validator
+from typing import Optional, List, Dict, Any
+import logging
+from logging.handlers import RotatingFileHandler
+import os
+from secrets import compare_digest
+from datetime import datetime, timedelta
+import sys
+import pandas as pd
+
+# Import cache manager
+from cache_manager import cache
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# Load secret from environment variable
+API_SECRET_KEY = os.getenv("API_SECRET_KEY", "YOUR_SECRET_KEY_CHANGE_THIS")
+
+# Validate that secret has been changed
+if API_SECRET_KEY == "YOUR_SECRET_KEY_CHANGE_THIS":
+    print("WARNING: Using default API secret key! Set API_SECRET_KEY environment variable.")
+
+# Cache TTL settings (in seconds)
+CACHE_TTL_SHORT = 1800      # 30 minutes - for trending/realtime data
+CACHE_TTL_MEDIUM = 3600     # 1 hour - for most queries
+CACHE_TTL_LONG = 7200       # 2 hours - for historical data
+
+# ============================================================================
+# LOGGING SETUP
+# ============================================================================
+
+log_dir = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(log_dir, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        RotatingFileHandler(
+            os.path.join(log_dir, "pytrends_api.log"),
+            maxBytes=10485760,  # 10MB
+            backupCount=5
+        ),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# FASTAPI APP INITIALIZATION
+# ============================================================================
+
+app = FastAPI(
+    title="Google Trends API - Comprehensive Edition",
+    description="Production-ready API for fetching Google Trends data with caching and all available endpoints",
+    version="2.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
+
+# ============================================================================
+# CORS CONFIGURATION
+# ============================================================================
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, replace with your actual domains
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def get_pytrends_client():
+    """Initialize and return a pytrends client"""
+    return TrendReq(
+        hl='en-US',
+        tz=360,
+        timeout=(10, 25),
+        retries=2,
+        backoff_factor=0.1
+    )
+
+def safe_dataframe_to_dict(df) -> List[Dict[str, Any]]:
+    """Safely convert pandas DataFrame to list of dictionaries"""
+    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+        return []
+    
+    try:
+        records = df.to_dict('records')
+        cleaned_records = []
+        for record in records:
+            cleaned_record = {}
+            for key, value in record.items():
+                if pd.isna(value):
+                    cleaned_record[key] = None
+                else:
+                    cleaned_record[key] = value
+            cleaned_records.append(cleaned_record)
+        return cleaned_records
+    except Exception as e:
+        logger.error(f"Error converting DataFrame to dict: {e}")
+        return []
+
+def dataframe_to_json_serializable(df) -> Dict[str, Any]:
+    """Convert DataFrame to JSON-serializable dictionary"""
+    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+        return {}
+    
+    try:
+        # Reset index to include date/time as a column
+        df_reset = df.reset_index()
+        
+        # Convert to dictionary
+        result = df_reset.to_dict(orient='records')
+        
+        # Clean NaN values
+        cleaned = []
+        for record in result:
+            cleaned_record = {}
+            for key, value in record.items():
+                if pd.isna(value):
+                    cleaned_record[key] = None
+                elif isinstance(value, pd.Timestamp):
+                    cleaned_record[key] = value.isoformat()
+                else:
+                    cleaned_record[key] = value
+            cleaned.append(cleaned_record)
+        
+        return cleaned
+    except Exception as e:
+        logger.error(f"Error converting DataFrame: {e}")
+        return {}
+
+# ============================================================================
+# AUTHENTICATION
+# ============================================================================
+
+async def verify_api_key(request: Request):
+    """Verify API key from request headers"""
+    api_key = request.headers.get("X-API-Key")
+    
+    if not api_key:
+        logger.warning(f"Missing API key from {request.client.host}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing API key. Include X-API-Key header."
+        )
+    
+    if not compare_digest(api_key, API_SECRET_KEY):
+        logger.warning(f"Invalid API key attempt from {request.client.host}")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid API key"
+        )
+    
+    return True
+
+# ============================================================================
+# REQUEST/RESPONSE MODELS
+# ============================================================================
+
+class InterestOverTimeRequest(BaseModel):
+    """Request model for interest over time"""
+    keywords: List[str] = Field(..., min_items=1, max_items=5, description="1-5 keywords to compare")
+    timeframe: str = Field(default="today 12-m", description="Time period (e.g., 'today 12-m', 'now 7-d', 'all')")
+    geo: str = Field(default="", description="Geographic location (e.g., 'US', 'GB', '' for worldwide)")
+    gprop: str = Field(default="", description="Google property filter (e.g., '', 'images', 'news', 'youtube', 'froogle')")
+
+class InterestByRegionRequest(BaseModel):
+    """Request model for interest by region"""
+    keywords: List[str] = Field(..., min_items=1, max_items=5)
+    timeframe: str = Field(default="today 12-m")
+    geo: str = Field(default="", description="Country code for sub-region data")
+    resolution: str = Field(default="COUNTRY", description="COUNTRY, REGION, CITY, or DMA")
+    inc_low_vol: bool = Field(default=True, description="Include low volume regions")
+    inc_geo_code: bool = Field(default=False, description="Include geographic codes")
+
+class RelatedQueriesRequest(BaseModel):
+    """Request model for related queries"""
+    keyword: str = Field(..., min_length=1, max_length=200)
+    timeframe: str = Field(default="today 12-m")
+    geo: str = Field(default="")
+
+class RelatedTopicsRequest(BaseModel):
+    """Request model for related topics"""
+    keyword: str = Field(..., min_length=1, max_length=200)
+    timeframe: str = Field(default="today 12-m")
+    geo: str = Field(default="")
+
+class TrendingSearchesRequest(BaseModel):
+    """Request model for trending searches"""
+    pn: str = Field(default="united_states", description="Country name (e.g., 'united_states', 'japan', 'india')")
+
+class SuggestionsRequest(BaseModel):
+    """Request model for keyword suggestions"""
+    keyword: str = Field(..., min_length=1, max_length=200)
+
+class ComprehensiveResearchRequest(BaseModel):
+    """Request model for comprehensive research endpoint"""
+    keywords: List[str] = Field(..., min_items=1, max_items=3, description="1-3 keywords for comprehensive analysis")
+    timeframe: str = Field(default="today 12-m")
+    geo: str = Field(default="")
+    include_related: bool = Field(default=True, description="Include related queries and topics")
+    include_regional: bool = Field(default=True, description="Include regional interest data")
+    include_trending: bool = Field(default=False, description="Include trending searches for the country")
+
+# ============================================================================
+# API ENDPOINTS - HEALTH & INFO
+# ============================================================================
+
+@app.get("/")
+async def root():
+    """Root endpoint - API information"""
+    return {
+        "service": "Google Trends API - Comprehensive Edition",
+        "version": "2.0.0",
+        "status": "active",
+        "features": {
+            "caching": "enabled (in-memory with optional Redis)",
+            "endpoints": 13,
+            "comprehensive_research": "enabled"
+        },
+        "endpoints": {
+            "interest_over_time": "/api/interest-over-time (POST)",
+            "interest_by_region": "/api/interest-by-region (POST)",
+            "related_queries": "/api/related-queries (POST)",
+            "related_topics": "/api/related-topics (POST)",
+            "trending_searches": "/api/trending-searches (POST)",
+            "today_searches": "/api/today-searches (GET)",
+            "realtime_trending": "/api/realtime-trending (GET)",
+            "suggestions": "/api/suggestions (POST)",
+            "categories": "/api/categories (GET)",
+            "comprehensive_research": "/api/research (POST) - AI Blog Writer Optimized",
+            "cache_stats": "/api/cache/stats (GET)",
+            "cache_clear": "/api/cache/clear (POST)",
+            "health": "/health (GET)",
+            "docs": "/docs (GET)"
+        }
+    }
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "service": "Google Trends API",
+        "cache": cache.get_stats()
+    }
+
+# ============================================================================
+# API ENDPOINTS - PYTRENDS METHODS
+# ============================================================================
+
+@app.post("/api/interest-over-time")
+async def interest_over_time(
+    request: InterestOverTimeRequest,
+    authenticated: bool = Depends(verify_api_key)
+):
+    """
+    Get interest over time for keywords
+    Returns historical indexed data showing popularity over time
+    """
+    cache_key = f"interest_over_time_{request.keywords}_{request.timeframe}_{request.geo}_{request.gprop}"
+    
+    # Check cache
+    cached = cache.get("interest_over_time", 
+                      keywords=request.keywords,
+                      timeframe=request.timeframe,
+                      geo=request.geo,
+                      gprop=request.gprop)
+    if cached:
+        logger.info(f"Cache hit: interest_over_time for {request.keywords}")
+        return cached
+    
+    try:
+        pytrends = get_pytrends_client()
+        pytrends.build_payload(
+            request.keywords,
+            timeframe=request.timeframe,
+            geo=request.geo,
+            gprop=request.gprop
+        )
+        
+        df = pytrends.interest_over_time()
+        
+        # Convert to JSON-serializable format
+        data = dataframe_to_json_serializable(df)
+        
+        response = {
+            "success": True,
+            "keywords": request.keywords,
+            "timeframe": request.timeframe,
+            "geo": request.geo or "worldwide",
+            "data": data,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        # Cache the response
+        cache.set(response, "interest_over_time", ttl=CACHE_TTL_MEDIUM,
+                 keywords=request.keywords,
+                 timeframe=request.timeframe,
+                 geo=request.geo,
+                 gprop=request.gprop)
+        
+        logger.info(f"Successfully fetched interest_over_time for {request.keywords}")
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error fetching interest_over_time: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error fetching data: {str(e)}"
+        )
+
+@app.post("/api/interest-by-region")
+async def interest_by_region(
+    request: InterestByRegionRequest,
+    authenticated: bool = Depends(verify_api_key)
+):
+    """
+    Get interest by geographic region
+    Returns popularity data broken down by location
+    """
+    # Check cache
+    cached = cache.get("interest_by_region",
+                      keywords=request.keywords,
+                      timeframe=request.timeframe,
+                      geo=request.geo,
+                      resolution=request.resolution)
+    if cached:
+        logger.info(f"Cache hit: interest_by_region for {request.keywords}")
+        return cached
+    
+    try:
+        pytrends = get_pytrends_client()
+        pytrends.build_payload(
+            request.keywords,
+            timeframe=request.timeframe,
+            geo=request.geo
+        )
+        
+        df = pytrends.interest_by_region(
+            resolution=request.resolution,
+            inc_low_vol=request.inc_low_vol,
+            inc_geo_code=request.inc_geo_code
+        )
+        
+        # Convert to JSON-serializable format
+        data = dataframe_to_json_serializable(df)
+        
+        response = {
+            "success": True,
+            "keywords": request.keywords,
+            "timeframe": request.timeframe,
+            "geo": request.geo or "worldwide",
+            "resolution": request.resolution,
+            "data": data,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        # Cache the response
+        cache.set(response, "interest_by_region", ttl=CACHE_TTL_MEDIUM,
+                 keywords=request.keywords,
+                 timeframe=request.timeframe,
+                 geo=request.geo,
+                 resolution=request.resolution)
+        
+        logger.info(f"Successfully fetched interest_by_region for {request.keywords}")
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error fetching interest_by_region: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error fetching data: {str(e)}"
+        )
+
+@app.post("/api/related-queries")
+async def related_queries(
+    request: RelatedQueriesRequest,
+    authenticated: bool = Depends(verify_api_key)
+):
+    """
+    Get related queries (rising and top)
+    Essential for discovering trending related keywords
+    """
+    # Check cache
+    cached = cache.get("related_queries",
+                      keyword=request.keyword,
+                      timeframe=request.timeframe,
+                      geo=request.geo)
+    if cached:
+        logger.info(f"Cache hit: related_queries for {request.keyword}")
+        return cached
+    
+    try:
+        pytrends = get_pytrends_client()
+        pytrends.build_payload(
+            [request.keyword],
+            timeframe=request.timeframe,
+            geo=request.geo
+        )
+        
+        related = pytrends.related_queries()
+        keyword_data = related.get(request.keyword, {})
+        
+        rising_df = keyword_data.get("rising")
+        top_df = keyword_data.get("top")
+        
+        response = {
+            "success": True,
+            "keyword": request.keyword,
+            "timeframe": request.timeframe,
+            "geo": request.geo or "worldwide",
+            "rising_queries": safe_dataframe_to_dict(rising_df),
+            "top_queries": safe_dataframe_to_dict(top_df),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        # Cache the response
+        cache.set(response, "related_queries", ttl=CACHE_TTL_MEDIUM,
+                 keyword=request.keyword,
+                 timeframe=request.timeframe,
+                 geo=request.geo)
+        
+        logger.info(f"Successfully fetched related_queries for {request.keyword}")
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error fetching related_queries: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error fetching data: {str(e)}"
+        )
+
+@app.post("/api/related-topics")
+async def related_topics(
+    request: RelatedTopicsRequest,
+    authenticated: bool = Depends(verify_api_key)
+):
+    """
+    Get related topics (rising and top)
+    Useful for discovering broader topic trends
+    """
+    # Check cache
+    cached = cache.get("related_topics",
+                      keyword=request.keyword,
+                      timeframe=request.timeframe,
+                      geo=request.geo)
+    if cached:
+        logger.info(f"Cache hit: related_topics for {request.keyword}")
+        return cached
+    
+    try:
+        pytrends = get_pytrends_client()
+        pytrends.build_payload(
+            [request.keyword],
+            timeframe=request.timeframe,
+            geo=request.geo
+        )
+        
+        related = pytrends.related_topics()
+        keyword_data = related.get(request.keyword, {})
+        
+        rising_df = keyword_data.get("rising")
+        top_df = keyword_data.get("top")
+        
+        response = {
+            "success": True,
+            "keyword": request.keyword,
+            "timeframe": request.timeframe,
+            "geo": request.geo or "worldwide",
+            "rising_topics": safe_dataframe_to_dict(rising_df),
+            "top_topics": safe_dataframe_to_dict(top_df),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        # Cache the response
+        cache.set(response, "related_topics", ttl=CACHE_TTL_MEDIUM,
+                 keyword=request.keyword,
+                 timeframe=request.timeframe,
+                 geo=request.geo)
+        
+        logger.info(f"Successfully fetched related_topics for {request.keyword}")
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error fetching related_topics: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error fetching data: {str(e)}"
+        )
+
+@app.post("/api/trending-searches")
+async def trending_searches(
+    request: TrendingSearchesRequest,
+    authenticated: bool = Depends(verify_api_key)
+):
+    """
+    Get daily trending searches for a specific country
+    Returns list of currently trending search terms
+    """
+    cached = cache.get("trending_searches", pn=request.pn)
+    if cached:
+        logger.info(f"Cache hit: trending_searches for {request.pn}")
+        return cached
+    
+    try:
+        pytrends = get_pytrends_client()
+        df = pytrends.trending_searches(pn=request.pn)
+        trending_list = df[0].tolist() if not df.empty else []
+        
+        response = {
+            "success": True,
+            "country": request.pn,
+            "trending_searches": trending_list,
+            "count": len(trending_list),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        cache.set(response, "trending_searches", ttl=CACHE_TTL_SHORT, pn=request.pn)
+        logger.info(f"Successfully fetched trending_searches for {request.pn}")
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error fetching trending_searches: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error fetching data: {str(e)}"
+        )
+
+@app.get("/api/today-searches")
+async def today_searches(
+    geo: str = Query(default="US", description="Country code (e.g., 'US', 'GB', 'IN')"),
+    authenticated: bool = Depends(verify_api_key)
+):
+    """
+    Get today's trending searches
+    Returns realtime trending topics for the specified country
+    """
+    cached = cache.get("today_searches", geo=geo)
+    if cached:
+        logger.info(f"Cache hit: today_searches for {geo}")
+        return cached
+    
+    try:
+        pytrends = get_pytrends_client()
+        df = pytrends.today_searches(pn=geo)
+        today_list = df[0].tolist() if not df.empty else []
+        
+        response = {
+            "success": True,
+            "country": geo,
+            "today_searches": today_list,
+            "count": len(today_list),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        cache.set(response, "today_searches", ttl=CACHE_TTL_SHORT, geo=geo)
+        logger.info(f"Successfully fetched today_searches for {geo}")
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error fetching today_searches: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error fetching data: {str(e)}"
+        )
+
+@app.get("/api/realtime-trending")
+async def realtime_trending(
+    geo: str = Query(default="US", description="Country code"),
+    category: str = Query(default="all", description="Category (e.g., 'all', 'b', 'e', 'h', etc.)"),
+    authenticated: bool = Depends(verify_api_key)
+):
+    """
+    Get realtime trending searches
+    Returns the most current trending data available
+    """
+    cached = cache.get("realtime_trending", geo=geo, category=category)
+    if cached:
+        logger.info(f"Cache hit: realtime_trending for {geo}")
+        return cached
+    
+    try:
+        pytrends = get_pytrends_client()
+        df = pytrends.realtime_trending_searches(pn=geo, cat=category)
+        data = safe_dataframe_to_dict(df)
+        
+        response = {
+            "success": True,
+            "country": geo,
+            "category": category,
+            "realtime_trending": data,
+            "count": len(data),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        cache.set(response, "realtime_trending", ttl=900, geo=geo, category=category)
+        logger.info(f"Successfully fetched realtime_trending for {geo}")
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error fetching realtime_trending: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error fetching data: {str(e)}"
+        )
+
+@app.post("/api/suggestions")
+async def suggestions(
+    request: SuggestionsRequest,
+    authenticated: bool = Depends(verify_api_key)
+):
+    """
+    Get keyword suggestions from Google
+    Useful for keyword expansion and research
+    """
+    cached = cache.get("suggestions", keyword=request.keyword)
+    if cached:
+        logger.info(f"Cache hit: suggestions for {request.keyword}")
+        return cached
+    
+    try:
+        pytrends = get_pytrends_client()
+        suggestions = pytrends.suggestions(keyword=request.keyword)
+        
+        response = {
+            "success": True,
+            "keyword": request.keyword,
+            "suggestions": suggestions,
+            "count": len(suggestions) if suggestions else 0,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        cache.set(response, "suggestions", ttl=CACHE_TTL_LONG, keyword=request.keyword)
+        logger.info(f"Successfully fetched suggestions for {request.keyword}")
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error fetching suggestions: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error fetching data: {str(e)}"
+        )
+
+@app.get("/api/categories")
+async def get_categories(authenticated: bool = Depends(verify_api_key)):
+    """
+    Get all available Google Trends categories
+    Use these category IDs when building payloads
+    """
+    cached = cache.get("categories")
+    if cached:
+        logger.info("Cache hit: categories")
+        return cached
+    
+    try:
+        pytrends = get_pytrends_client()
+        categories = pytrends.categories()
+        
+        response = {
+            "success": True,
+            "categories": categories,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        cache.set(response, "categories", ttl=86400)
+        logger.info("Successfully fetched categories")
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error fetching categories: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error fetching data: {str(e)}"
+        )
+
+# ============================================================================
+# COMPREHENSIVE RESEARCH ENDPOINT - AI BLOG WRITER OPTIMIZED
+# ============================================================================
+
+@app.post("/api/research")
+async def comprehensive_research(
+    request: ComprehensiveResearchRequest,
+    background_tasks: BackgroundTasks,
+    authenticated: bool = Depends(verify_api_key)
+):
+    """
+    ?? COMPREHENSIVE RESEARCH ENDPOINT - Optimized for AI Blog Writers
+    
+    Returns ALL relevant data for blog content creation in a single request:
+    - Interest over time (historical trends)
+    - Related queries (rising and top)
+    - Related topics (rising and top)
+    - Regional interest data (optional)
+    - Trending searches (optional)
+    
+    This endpoint is designed to give your AI blog writer everything it needs
+    to create well-researched, SEO-optimized content.
+    """
+    cached = cache.get("comprehensive_research",
+                      keywords=request.keywords,
+                      timeframe=request.timeframe,
+                      geo=request.geo,
+                      include_related=request.include_related,
+                      include_regional=request.include_regional)
+    if cached:
+        logger.info(f"Cache hit: comprehensive_research for {request.keywords}")
+        return cached
+    
+    try:
+        pytrends = get_pytrends_client()
+        pytrends.build_payload(request.keywords, timeframe=request.timeframe, geo=request.geo)
+        
+        response = {
+            "success": True,
+            "keywords": request.keywords,
+            "timeframe": request.timeframe,
+            "geo": request.geo or "worldwide",
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        # 1. Interest Over Time
+        try:
+            df_interest = pytrends.interest_over_time()
+            response["interest_over_time"] = dataframe_to_json_serializable(df_interest)
+        except Exception as e:
+            logger.warning(f"Failed to fetch interest_over_time: {e}")
+            response["interest_over_time"] = []
+        
+        # 2. Related Queries and Topics
+        if request.include_related:
+            response["related_data"] = {}
+            
+            for keyword in request.keywords:
+                response["related_data"][keyword] = {
+                    "queries": {"rising": [], "top": []},
+                    "topics": {"rising": [], "top": []}
+                }
+                
+                try:
+                    related_queries = pytrends.related_queries()
+                    keyword_queries = related_queries.get(keyword, {})
+                    response["related_data"][keyword]["queries"]["rising"] = safe_dataframe_to_dict(
+                        keyword_queries.get("rising")
+                    )
+                    response["related_data"][keyword]["queries"]["top"] = safe_dataframe_to_dict(
+                        keyword_queries.get("top")
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to fetch related_queries for {keyword}: {e}")
+                
+                try:
+                    related_topics = pytrends.related_topics()
+                    keyword_topics = related_topics.get(keyword, {})
+                    response["related_data"][keyword]["topics"]["rising"] = safe_dataframe_to_dict(
+                        keyword_topics.get("rising")
+                    )
+                    response["related_data"][keyword]["topics"]["top"] = safe_dataframe_to_dict(
+                        keyword_topics.get("top")
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to fetch related_topics for {keyword}: {e}")
+        
+        # 3. Regional Interest
+        if request.include_regional:
+            try:
+                df_region = pytrends.interest_by_region(resolution="COUNTRY", inc_low_vol=True)
+                response["interest_by_region"] = dataframe_to_json_serializable(df_region)
+            except Exception as e:
+                logger.warning(f"Failed to fetch interest_by_region: {e}")
+                response["interest_by_region"] = []
+        
+        # 4. Trending Searches
+        if request.include_trending and request.geo:
+            try:
+                country_map = {
+                    "US": "united_states", "GB": "united_kingdom", "IN": "india",
+                    "CA": "canada", "AU": "australia", "JP": "japan", "DE": "germany",
+                    "FR": "france", "BR": "brazil", "IT": "italy", "ES": "spain"
+                }
+                country_name = country_map.get(request.geo.upper(), "united_states")
+                df_trending = pytrends.trending_searches(pn=country_name)
+                response["trending_searches"] = df_trending[0].tolist() if not df_trending.empty else []
+            except Exception as e:
+                logger.warning(f"Failed to fetch trending_searches: {e}")
+                response["trending_searches"] = []
+        
+        cache.set(response, "comprehensive_research", ttl=CACHE_TTL_MEDIUM,
+                 keywords=request.keywords, timeframe=request.timeframe, geo=request.geo,
+                 include_related=request.include_related, include_regional=request.include_regional)
+        
+        logger.info(f"Successfully completed comprehensive research for {request.keywords}")
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error in comprehensive_research: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error fetching comprehensive data: {str(e)}"
+        )
+
+# ============================================================================
+# CACHE MANAGEMENT ENDPOINTS
+# ============================================================================
+
+@app.get("/api/cache/stats")
+async def cache_stats(authenticated: bool = Depends(verify_api_key)):
+    """Get cache statistics"""
+    stats = cache.get_stats()
+    return {
+        "success": True,
+        "cache_stats": stats,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+@app.post("/api/cache/clear")
+async def cache_clear(authenticated: bool = Depends(verify_api_key)):
+    """Clear all cached data"""
+    try:
+        cache.clear_all()
+        return {
+            "success": True,
+            "message": "Cache cleared successfully",
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error clearing cache: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error clearing cache: {str(e)}"
+        )
+
+# ============================================================================
+# BACKGROUND TASKS & EVENT HANDLERS
+# ============================================================================
+
+@app.on_event("startup")
+async def startup_event():
+    """Startup tasks"""
+    logger.info("=" * 60)
+    logger.info("Google Trends API - Comprehensive Edition Starting")
+    logger.info(f"Version: 2.0.0")
+    logger.info(f"Python: {sys.version}")
+    logger.info(f"Cache: Enabled (in-memory + optional Redis)")
+    logger.info(f"API Key: {'Configured' if API_SECRET_KEY != 'YOUR_SECRET_KEY_CHANGE_THIS' else 'DEFAULT (CHANGE THIS!)'}")
+    logger.info("=" * 60)
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Shutdown tasks"""
+    logger.info("Google Trends API shutting down")
+
+# ============================================================================
+# ERROR HANDLERS
+# ============================================================================
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Global exception handler"""
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "success": False,
+            "error": "Internal server error",
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    )
+
+# ============================================================================
+# RUN APPLICATION
+# ============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "pytrends_api:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        log_level="info"
+    )

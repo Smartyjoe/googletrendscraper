@@ -1,0 +1,127 @@
+# ============================================================================
+# .htaccess for Google Trends API (cPanel)
+# Place this file in your application root directory
+# ============================================================================
+
+# Enable Passenger (Python handler)
+PassengerEnabled On
+
+# Set the application root
+# IMPORTANT: Replace 'USERNAME' with your actual cPanel username
+PassengerAppRoot /home/propxtur/pytrends_api
+
+# Set Python version (optional, but recommended)
+# This should match your Python app configuration in cPanel
+PassengerPython /home/propxtur/virtualenv/pytrends_api/3.8/bin/python3
+
+# ============================================================================
+# Environment Variables
+# ============================================================================
+
+# Set your API secret key
+# SECURITY: Replace with your actual secret key
+SetEnv API_SECRET_KEY "CmgEDvH-O5JVmsXcE7Nci5Qv22suJJ74Gq8k3Y9NlDc"
+
+# Optional: Set timezone
+SetEnv TZ "UTC"
+
+# ============================================================================
+# Security Headers
+# ============================================================================
+
+# Prevent clickjacking
+Header always set X-Frame-Options "DENY"
+
+# Prevent MIME type sniffing
+Header always set X-Content-Type-Options "nosniff"
+
+# XSS Protection
+Header always set X-XSS-Protection "1; mode=block"
+
+# Content Security Policy (adjust as needed)
+Header always set Content-Security-Policy "default-src 'self'"
+
+# ============================================================================
+# HTTPS Enforcement (Recommended)
+# ============================================================================
+
+# Force HTTPS - Uncomment these lines to enforce SSL
+# RewriteEngine On
+# RewriteCond %{HTTPS} off
+# RewriteRule ^(.*)$ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+
+# ============================================================================
+# CORS Configuration (if needed for cross-origin requests)
+# ============================================================================
+
+# Allow CORS from specific domain (your Laravel app)
+# Replace 'https://yourlaravelapp.com' with your actual Laravel domain
+# Header always set Access-Control-Allow-Origin "https://yourlaravelapp.com"
+# Header always set Access-Control-Allow-Methods "GET, POST, OPTIONS"
+# Header always set Access-Control-Allow-Headers "Content-Type, X-API-Key"
+# Header always set Access-Control-Max-Age "3600"
+
+# Allow CORS from any origin (less secure, use only if necessary)
+# Header always set Access-Control-Allow-Origin "*"
+# Header always set Access-Control-Allow-Methods "GET, POST, OPTIONS"
+# Header always set Access-Control-Allow-Headers "Content-Type, X-API-Key"
+
+# ============================================================================
+# Error Pages (Optional)
+# ============================================================================
+
+# Custom error pages
+# ErrorDocument 404 /404.html
+# ErrorDocument 500 /500.html
+
+# ============================================================================
+# Performance Optimization
+# ============================================================================
+
+# Enable compression
+<IfModule mod_deflate.c>
+    AddOutputFilterByType DEFLATE application/json
+    AddOutputFilterByType DEFLATE text/plain
+</IfModule>
+
+# Cache static resources (if any)
+<IfModule mod_expires.c>
+    ExpiresActive On
+    ExpiresByType application/json "access plus 0 seconds"
+</IfModule>
+
+# ============================================================================
+# Logging (Optional)
+# ============================================================================
+
+# Custom log file (if your hosting supports it)
+# CustomLog /home/USERNAME/pytrends_api/logs/access.log combined
+# ErrorLog /home/USERNAME/pytrends_api/logs/error.log
+
+# ============================================================================
+# Deny Access to Sensitive Files
+# ============================================================================
+
+# Protect configuration files
+<FilesMatch "^(passenger_wsgi\.py|requirements\.txt|\.env)$">
+    Require all denied
+</FilesMatch>
+
+# Protect log files
+<FilesMatch "\.log$">
+    Require all denied
+</FilesMatch>
+
+# ============================================================================
+# Notes
+# ============================================================================
+
+# 1. Replace all instances of 'USERNAME' with your actual cPanel username
+# 2. Replace 'REPLACE-WITH-YOUR-ACTUAL-SECRET-KEY-MIN-32-CHARS' with your secret
+# 3. Uncomment HTTPS enforcement lines if you have SSL certificate installed
+# 4. Adjust CORS settings based on your Laravel application domain
+# 5. After making changes, restart your Python app in cPanel
+
+# To restart the application after changes:
+# Method 1: Via cPanel - Go to "Setup Python App" and click "Restart"
+# Method 2: Via SSH - Run: touch ~/pytrends_api/tmp/restart.txt
