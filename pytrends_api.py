@@ -649,8 +649,25 @@ async def trending_searches(
         return cached
     
     try:
+        # Pytrends trending_searches requires full country names, not codes.
+        # We normalize here to prevent common 200/404 errors.
+        country_map = {
+            "US": "united_states", "GB": "united_kingdom", "IN": "india",
+            "CA": "canada", "AU": "australia", "JP": "japan", "DE": "germany",
+            "FR": "france", "BR": "brazil", "IT": "italy", "ES": "spain",
+            "NG": "nigeria", "ZA": "south_africa", "KE": "kenya"
+        }
+        
+        pn_normalized = request.pn.lower().replace(" ", "_")
+        # If it looks like a 2-letter code, try to map it
+        if len(pn_normalized) == 2:
+            pn_normalized = country_map.get(pn_normalized.upper(), pn_normalized)
+            
+        logger.info(f"Fetching trending_searches for {pn_normalized} (original: {request.pn})")
+
         def _fetch(pt):
-            return pt.trending_searches(pn=request.pn)
+            return pt.trending_searches(pn=pn_normalized)
+            
         df = execute_with_proxy_retry(_fetch)
         trending_list = df[0].tolist() if not df.empty else []
         
