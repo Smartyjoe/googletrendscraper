@@ -16,6 +16,8 @@ import os
 from secrets import compare_digest
 from datetime import datetime
 import sys
+import random
+import time
 import pandas as pd
 from dotenv import load_dotenv
 load_dotenv()
@@ -25,6 +27,7 @@ load_dotenv()
 from cache_manager import cache
 from services.sira_service import SIRAServiceConfig, clean_text, run_sira_pipeline
 from services import sira_service
+from proxy_manager import proxy_manager
 
 # ============================================================================
 # CONFIGURATION
@@ -69,6 +72,7 @@ logging.basicConfig(
             backupCount=5
         ),
         logging.StreamHandler(sys.stdout)
+
     ]
 )
 
@@ -102,15 +106,52 @@ app.add_middleware(
 # HELPER FUNCTIONS
 # ============================================================================
 
-def get_pytrends_client():
-    """Initialize and return a pytrends client"""
+def get_pytrends_client(proxy_url: Optional[str] = None) -> TrendReq:
+    """
+    Initialize and return a pytrends client with proxy support.
+    """
+    if proxy_url is None:
+        proxy_url = proxy_manager.get_proxy()
+
+    if proxy_url:
+        proxies = [proxy_url]
+        logger.debug(f"PyTrends client using proxy: {proxy_url[:40]}...")
+    else:
+        proxies = ''
+        logger.warning("No proxy configured — direct cloud requests may trigger Google 429 rate limits.")
+
     return TrendReq(
         hl='en-US',
         tz=360,
         timeout=(10, 25),
-        retries=2,
-        backoff_factor=0.1
+        retries=3,
+        backoff_factor=1.0,
+        proxies=proxies
     )
+
+def execute_with_proxy_retry(operation_fn, max_retries: int = 3):
+    """
+    Execute a pytrends operation with automatic proxy rotation.
+    """
+    last_error = None
+    current_proxy = proxy_manager.get_proxy()
+
+    for attempt in range(max_retries):
+        try:
+            if attempt > 0:
+                time.sleep(random.uniform(2, 5) * attempt)
+            pytrends = get_pytrends_client(proxy_url=current_proxy)
+            return operation_fn(pytrends)
+        except Exception as e:
+            last_error = e
+            error_str = str(e).lower()
+            is_rate_limit = any(x in error_str for x in ['429', 'too many', 'sorry', 'responseerror'])
+            if is_rate_limit and attempt < max_retries - 1:
+                proxy_manager.mark_failed(current_proxy)
+                current_proxy = proxy_manager.rotate()
+            else:
+                raise
+    raise last_error
 
 def safe_dataframe_to_dict(df) -> List[Dict[str, Any]]:
     """Safely convert pandas DataFrame to list of dictionaries"""
@@ -118,9 +159,9 @@ def safe_dataframe_to_dict(df) -> List[Dict[str, Any]]:
         return []
     
     try:
-        records = df.to_dict('records')
+        result = df.reset_index().to_dict(orient='records')
         cleaned_records = []
-        for record in records:
+        for record in result:
             cleaned_record = {}
             for key, value in record.items():
                 if pd.isna(value):
@@ -134,9 +175,6 @@ def safe_dataframe_to_dict(df) -> List[Dict[str, Any]]:
         return []
 
 def dataframe_to_json_serializable(df) -> Dict[str, Any]:
-    """Convert DataFrame to JSON-serializable dictionary"""
-    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
-        return {}
     
     try:
         # Reset index to include date/time as a column
@@ -331,15 +369,16 @@ async def interest_over_time(
         return cached
     
     try:
-        pytrends = get_pytrends_client()
-        pytrends.build_payload(
-            request.keywords,
-            timeframe=request.timeframe,
-            geo=request.geo,
-            gprop=request.gprop
-        )
-        
-        df = pytrends.interest_over_time()
+        def _fetch(pt):
+            pt.build_payload(
+                request.keywords,
+                timeframe=request.timeframe,
+                geo=request.geo,
+                gprop=request.gprop
+            )
+            return pt.interest_over_time()
+            
+        df = execute_with_proxy_retry(_fetch)
         
         # Convert to JSON-serializable format
         data = dataframe_to_json_serializable(df)
@@ -390,18 +429,19 @@ async def interest_by_region(
         return cached
     
     try:
-        pytrends = get_pytrends_client()
-        pytrends.build_payload(
-            request.keywords,
-            timeframe=request.timeframe,
-            geo=request.geo
-        )
-        
-        df = pytrends.interest_by_region(
-            resolution=request.resolution,
-            inc_low_vol=request.inc_low_vol,
-            inc_geo_code=request.inc_geo_code
-        )
+        def _fetch(pt):
+            pt.build_payload(
+                request.keywords,
+                timeframe=request.timeframe,
+                geo=request.geo
+            )
+            return pt.interest_by_region(
+                resolution=request.resolution,
+                inc_low_vol=request.inc_low_vol,
+                inc_geo_code=request.inc_geo_code
+            )
+            
+        df = execute_with_proxy_retry(_fetch)
         
         # Convert to JSON-serializable format
         data = dataframe_to_json_serializable(df)
@@ -510,14 +550,15 @@ async def related_topics(
         return cached
     
     try:
-        pytrends = get_pytrends_client()
-        pytrends.build_payload(
-            [request.keyword],
-            timeframe=request.timeframe,
-            geo=request.geo
-        )
-        
-        related = pytrends.related_topics()
+        def _fetch(pt):
+            pt.build_payload(
+                [request.keyword],
+                timeframe=request.timeframe,
+                geo=request.geo
+            )
+            return pt.related_topics()
+            
+        related = execute_with_proxy_retry(_fetch)
         keyword_data = related.get(request.keyword, {})
         
         rising_df = keyword_data.get("rising")
@@ -564,8 +605,9 @@ async def trending_searches(
         return cached
     
     try:
-        pytrends = get_pytrends_client()
-        df = pytrends.trending_searches(pn=request.pn)
+        def _fetch(pt):
+            return pt.trending_searches(pn=request.pn)
+        df = execute_with_proxy_retry(_fetch)
         trending_list = df[0].tolist() if not df.empty else []
         
         response = {
@@ -714,8 +756,9 @@ async def get_categories(authenticated: bool = Security(verify_api_key)):
         return cached
     
     try:
-        pytrends = get_pytrends_client()
-        categories = pytrends.categories()
+        def _fetch(pt):
+            return pt.categories()
+        categories = execute_with_proxy_retry(_fetch)
         
         response = {
             "success": True,
@@ -768,24 +811,28 @@ async def comprehensive_research(
         return cached
     
     try:
-        pytrends = get_pytrends_client()
-        pytrends.build_payload(request.keywords, timeframe=request.timeframe, geo=request.geo)
-        
-        response = {
-            "success": True,
-            "keywords": request.keywords,
-            "timeframe": request.timeframe,
-            "geo": request.geo or "worldwide",
-            "timestamp": datetime.utcnow().isoformat()
-        }
-        
-        # 1. Interest Over Time
-        try:
-            df_interest = pytrends.interest_over_time()
-            response["interest_over_time"] = dataframe_to_json_serializable(df_interest)
-        except Exception as e:
-            logger.warning(f"Failed to fetch interest_over_time: {e}")
-            response["interest_over_time"] = []
+        def _fetch_all(pt):
+            pt.build_payload(request.keywords, timeframe=request.timeframe, geo=request.geo)
+            
+            res = {
+                "success": True,
+                "keywords": request.keywords,
+                "timeframe": request.timeframe,
+                "geo": request.geo or "worldwide",
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            
+            # 1. Interest Over Time
+            try:
+                df_interest = pt.interest_over_time()
+                res["interest_over_time"] = dataframe_to_json_serializable(df_interest)
+            except Exception as e:
+                logger.warning(f"Failed to fetch interest_over_time: {e}")
+                res["interest_over_time"] = []
+            return res, pt
+
+        fetch_res, pytrends = execute_with_proxy_retry(_fetch_all)
+        response = fetch_res
         
         # 2. Related Queries and Topics
         if request.include_related:
