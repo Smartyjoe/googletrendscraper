@@ -22,10 +22,10 @@ hiredis==2.2.3
 
 # HTTP Client (used by pytrends)
 # IMPORTANT: Pytrends requires older versions due to urllib3 compatibility
-requests>=2.28.0,<2.32.0
+requests>=2.28.0
 urllib3>=1.26.0,<2.0.0
-# ddgs requires lxml>=6. Keep this aligned with ddgs while remaining pytrends-compatible.
-lxml>=6.0.0,<7.0.0
+# Loose lxml range to satisfy both ddgs/pytrends and trafilatura/htmldate
+lxml>=5.3.0,<7.0.0
 httpx>=0.28.1
 
 # SIRA web search + extraction
@@ -36,7 +36,7 @@ trafilatura==2.0.0
 python-dotenv==1.0.0
 
 # Date/Time utilities
-python-dateutil==2.8.2
+python-dateutil>=2.8.2
 
 # JSON handling improvements
 orjson==3.9.10
