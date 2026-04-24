@@ -352,6 +352,31 @@ async def root():
         }
     }
 
+@app.get("/api/debug/proxy")
+async def debug_proxy(authenticated: bool = Security(verify_api_key)):
+    """Debug endpoint to verify proxy configuration and connectivity."""
+    import requests
+    status = proxy_manager.get_status()
+    proxy = proxy_manager.get_proxy()
+    
+    test_result = {"proxy_used": proxy[:30] + "..." if proxy else None}
+    
+    if proxy:
+        try:
+            # Try a simple request through the proxy
+            proxies = {"http": proxy, "https": proxy}
+            res = requests.get("https://httpbin.org/ip", proxies=proxies, timeout=10)
+            test_result["connectivity"] = "success"
+            test_result["proxy_ip"] = res.json().get("origin")
+        except Exception as e:
+            test_result["connectivity"] = "failed"
+            test_result["error"] = str(e)
+    
+    return {
+        "proxy_manager_status": status,
+        "test_connection": test_result
+    }
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
