@@ -3,22 +3,28 @@ Google Trends API - Comprehensive Edition
 Production-ready FastAPI service with caching, all endpoints, and comprehensive research capability
 """
 
-from fastapi import FastAPI, Request, HTTPException, Depends, status, Query, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException, Security, status, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader
 from pytrends.request import TrendReq
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, root_validator
 from typing import Optional, List, Dict, Any
 import logging
 from logging.handlers import RotatingFileHandler
 import os
 from secrets import compare_digest
-from datetime import datetime, timedelta
+from datetime import datetime
 import sys
 import pandas as pd
+from dotenv import load_dotenv
+load_dotenv()
+
 
 # Import cache manager
 from cache_manager import cache
+from services.sira_service import SIRAServiceConfig, clean_text, run_sira_pipeline
+from services import sira_service
 
 # ============================================================================
 # CONFIGURATION
@@ -26,6 +32,12 @@ from cache_manager import cache
 
 # Load secret from environment variable
 API_SECRET_KEY = os.getenv("API_SECRET_KEY", "YOUR_SECRET_KEY_CHANGE_THIS")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+OPENROUTER_MODEL_INTENT = os.getenv("OPENROUTER_MODEL_INTENT", "openai/gpt-4o-mini")
+OPENROUTER_MODEL_FACTCHECK = os.getenv("OPENROUTER_MODEL_FACTCHECK", "openai/gpt-4o-mini")
+OPENROUTER_REFERER = os.getenv("OPENROUTER_REFERER", "")
+OPENROUTER_APP_TITLE = os.getenv("OPENROUTER_APP_TITLE", "PyTrends SIRA API")
 
 # Validate that secret has been changed
 if API_SECRET_KEY == "YOUR_SECRET_KEY_CHANGE_THIS":
@@ -35,6 +47,10 @@ if API_SECRET_KEY == "YOUR_SECRET_KEY_CHANGE_THIS":
 CACHE_TTL_SHORT = 1800      # 30 minutes - for trending/realtime data
 CACHE_TTL_MEDIUM = 3600     # 1 hour - for most queries
 CACHE_TTL_LONG = 7200       # 2 hours - for historical data
+SIRA_MAX_SOURCES_FAST = 3
+SIRA_MAX_SOURCES_DEEP = 5
+SIRA_MAX_URLS_PER_QUERY_FAST = 3
+SIRA_MAX_URLS_PER_QUERY_DEEP = 5
 
 # ============================================================================
 # LOGGING SETUP
@@ -151,10 +167,15 @@ def dataframe_to_json_serializable(df) -> Dict[str, Any]:
 # AUTHENTICATION
 # ============================================================================
 
-async def verify_api_key(request: Request):
+# Security scheme exposed in OpenAPI/Swagger (shows Authorize button)
+api_key_header = APIKeyHeader(
+    name="X-API-Key",
+    scheme_name="ApiKeyAuth",
+    auto_error=False
+)
+
+async def verify_api_key(request: Request, api_key: Optional[str] = Security(api_key_header)):
     """Verify API key from request headers"""
-    api_key = request.headers.get("X-API-Key")
-    
     if not api_key:
         logger.warning(f"Missing API key from {request.client.host}")
         raise HTTPException(
@@ -220,6 +241,24 @@ class ComprehensiveResearchRequest(BaseModel):
     include_regional: bool = Field(default=True, description="Include regional interest data")
     include_trending: bool = Field(default=False, description="Include trending searches for the country")
 
+class SIRAResearchRequest(BaseModel):
+    """Request model for Smart Intelligence Research API endpoint."""
+    title: Optional[str] = Field(default=None, max_length=240, description="Article/blog title or main topic")
+    description: Optional[str] = Field(default=None, max_length=4000, description="User context and claims")
+    geo: str = Field(default="", description="Country code like US, GB, IN (optional)")
+    research_depth: str = Field(default="deep", description="fast or deep")
+
+    @root_validator
+    def validate_payload(cls, values):
+        title = clean_text(values.get("title") or "")
+        description = clean_text(values.get("description") or "")
+        research_depth = values.get("research_depth")
+        if not title and not description:
+            raise ValueError("At least one of title or description must be provided.")
+        if research_depth not in {"fast", "deep"}:
+            raise ValueError("research_depth must be either 'fast' or 'deep'.")
+        return values
+
 # ============================================================================
 # API ENDPOINTS - HEALTH & INFO
 # ============================================================================
@@ -233,8 +272,9 @@ async def root():
         "status": "active",
         "features": {
             "caching": "enabled (in-memory with optional Redis)",
-            "endpoints": 13,
-            "comprehensive_research": "enabled"
+            "endpoints": 14,
+            "comprehensive_research": "enabled",
+            "sira_research": "enabled"
         },
         "endpoints": {
             "interest_over_time": "/api/interest-over-time (POST)",
@@ -247,6 +287,7 @@ async def root():
             "suggestions": "/api/suggestions (POST)",
             "categories": "/api/categories (GET)",
             "comprehensive_research": "/api/research (POST) - AI Blog Writer Optimized",
+            "sira_research": "/api/sira/research (POST) - Smart Intelligence Research API",
             "cache_stats": "/api/cache/stats (GET)",
             "cache_clear": "/api/cache/clear (POST)",
             "health": "/health (GET)",
@@ -271,7 +312,7 @@ async def health_check():
 @app.post("/api/interest-over-time")
 async def interest_over_time(
     request: InterestOverTimeRequest,
-    authenticated: bool = Depends(verify_api_key)
+    authenticated: bool = Security(verify_api_key)
 ):
     """
     Get interest over time for keywords
@@ -332,7 +373,7 @@ async def interest_over_time(
 @app.post("/api/interest-by-region")
 async def interest_by_region(
     request: InterestByRegionRequest,
-    authenticated: bool = Depends(verify_api_key)
+    authenticated: bool = Security(verify_api_key)
 ):
     """
     Get interest by geographic region
@@ -395,7 +436,7 @@ async def interest_by_region(
 @app.post("/api/related-queries")
 async def related_queries(
     request: RelatedQueriesRequest,
-    authenticated: bool = Depends(verify_api_key)
+    authenticated: bool = Security(verify_api_key)
 ):
     """
     Get related queries (rising and top)
@@ -453,7 +494,7 @@ async def related_queries(
 @app.post("/api/related-topics")
 async def related_topics(
     request: RelatedTopicsRequest,
-    authenticated: bool = Depends(verify_api_key)
+    authenticated: bool = Security(verify_api_key)
 ):
     """
     Get related topics (rising and top)
@@ -511,7 +552,7 @@ async def related_topics(
 @app.post("/api/trending-searches")
 async def trending_searches(
     request: TrendingSearchesRequest,
-    authenticated: bool = Depends(verify_api_key)
+    authenticated: bool = Security(verify_api_key)
 ):
     """
     Get daily trending searches for a specific country
@@ -549,7 +590,7 @@ async def trending_searches(
 @app.get("/api/today-searches")
 async def today_searches(
     geo: str = Query(default="US", description="Country code (e.g., 'US', 'GB', 'IN')"),
-    authenticated: bool = Depends(verify_api_key)
+    authenticated: bool = Security(verify_api_key)
 ):
     """
     Get today's trending searches
@@ -588,7 +629,7 @@ async def today_searches(
 async def realtime_trending(
     geo: str = Query(default="US", description="Country code"),
     category: str = Query(default="all", description="Category (e.g., 'all', 'b', 'e', 'h', etc.)"),
-    authenticated: bool = Depends(verify_api_key)
+    authenticated: bool = Security(verify_api_key)
 ):
     """
     Get realtime trending searches
@@ -627,7 +668,7 @@ async def realtime_trending(
 @app.post("/api/suggestions")
 async def suggestions(
     request: SuggestionsRequest,
-    authenticated: bool = Depends(verify_api_key)
+    authenticated: bool = Security(verify_api_key)
 ):
     """
     Get keyword suggestions from Google
@@ -662,7 +703,7 @@ async def suggestions(
         )
 
 @app.get("/api/categories")
-async def get_categories(authenticated: bool = Depends(verify_api_key)):
+async def get_categories(authenticated: bool = Security(verify_api_key)):
     """
     Get all available Google Trends categories
     Use these category IDs when building payloads
@@ -701,7 +742,7 @@ async def get_categories(authenticated: bool = Depends(verify_api_key)):
 async def comprehensive_research(
     request: ComprehensiveResearchRequest,
     background_tasks: BackgroundTasks,
-    authenticated: bool = Depends(verify_api_key)
+    authenticated: bool = Security(verify_api_key)
 ):
     """
     ?? COMPREHENSIVE RESEARCH ENDPOINT - Optimized for AI Blog Writers
@@ -819,11 +860,68 @@ async def comprehensive_research(
         )
 
 # ============================================================================
+# SIRA ENDPOINT - SMART INTELLIGENCE RESEARCH API
+# ============================================================================
+
+@app.post("/api/sira/research")
+async def sira_research(
+    request: SIRAResearchRequest,
+    authenticated: bool = Security(verify_api_key)
+):
+    """
+    Smart Intelligence Research API endpoint.
+    Combines intent analysis, market pulse, web extraction, and fact-check summary.
+    """
+    title = clean_text(request.title or "")
+    description = clean_text(request.description or "")
+    geo = clean_text(request.geo or "").upper()
+    depth = request.research_depth
+
+    cached = cache.get("sira_research", title=title, description=description, geo=geo, depth=depth)
+    if cached:
+        logger.info("Cache hit: sira_research")
+        return cached
+
+    config = SIRAServiceConfig(
+        openrouter_api_key=OPENROUTER_API_KEY,
+        openrouter_base_url=OPENROUTER_BASE_URL,
+        openrouter_model_intent=OPENROUTER_MODEL_INTENT,
+        openrouter_model_factcheck=OPENROUTER_MODEL_FACTCHECK,
+        openrouter_referer=OPENROUTER_REFERER,
+        openrouter_app_title=OPENROUTER_APP_TITLE,
+        max_sources_fast=SIRA_MAX_SOURCES_FAST,
+        max_sources_deep=SIRA_MAX_SOURCES_DEEP,
+        max_urls_per_query_fast=SIRA_MAX_URLS_PER_QUERY_FAST,
+        max_urls_per_query_deep=SIRA_MAX_URLS_PER_QUERY_DEEP,
+        cache_ttl_seconds=CACHE_TTL_MEDIUM
+    )
+
+    response = await run_sira_pipeline(
+        title=title,
+        description=description,
+        geo=geo,
+        depth=depth,
+        config=config,
+        get_pytrends_client=get_pytrends_client
+    )
+
+    cache.set(
+        response,
+        "sira_research",
+        ttl=CACHE_TTL_MEDIUM,
+        title=title,
+        description=description,
+        geo=geo,
+        depth=depth
+    )
+    return response
+
+# ============================================================================
 # CACHE MANAGEMENT ENDPOINTS
 # ============================================================================
 
 @app.get("/api/cache/stats")
-async def cache_stats(authenticated: bool = Depends(verify_api_key)):
+async def cache_stats(authenticated: bool = Security(verify_api_key)):
     """Get cache statistics"""
     stats = cache.get_stats()
     return {
@@ -833,7 +931,7 @@ async def cache_stats(authenticated: bool = Depends(verify_api_key)):
     }
 
 @app.post("/api/cache/clear")
-async def cache_clear(authenticated: bool = Depends(verify_api_key)):
+async def cache_clear(authenticated: bool = Security(verify_api_key)):
     """Clear all cached data"""
     try:
         cache.clear_all()
@@ -862,6 +960,11 @@ async def startup_event():
     logger.info(f"Python: {sys.version}")
     logger.info(f"Cache: Enabled (in-memory + optional Redis)")
     logger.info(f"API Key: {'Configured' if API_SECRET_KEY != 'YOUR_SECRET_KEY_CHANGE_THIS' else 'DEFAULT (CHANGE THIS!)'}")
+    logger.info(f"OpenRouter: {'Configured' if OPENROUTER_API_KEY else 'Not configured (SIRA will use fallbacks)'}")
+    logger.info(
+        f"SIRA optional deps: ddgs={'yes' if sira_service.DDGS is not None else 'no'}, "
+        f"trafilatura={'yes' if sira_service.trafilatura is not None else 'no'}"
+    )
     logger.info("=" * 60)
 
 @app.on_event("shutdown")

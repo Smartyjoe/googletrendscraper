@@ -169,6 +169,9 @@ All API endpoints (except `/`, `/health`, `/docs`) require API key authenticatio
 X-API-Key: your-secure-api-key-here
 ```
 
+**Swagger UI testing:**
+Open `/docs`, click **Authorize**, paste your API key as the value for `X-API-Key`, then run secured endpoints directly from Swagger.
+
 **Example with curl:**
 ```bash
 curl -X POST https://your-api.com/api/related-queries \
