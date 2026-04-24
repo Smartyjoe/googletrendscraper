@@ -20,7 +20,26 @@ import random
 import time
 import pandas as pd
 from dotenv import load_dotenv
+import certifi
 load_dotenv()
+
+# Fix for SSL: CERTIFICATE_VERIFY_FAILED on cloud environments like Render
+os.environ['SSL_CERT_FILE'] = certifi.where()
+os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
+import requests
+from urllib3.exceptions import InsecureRequestWarning
+print(f"SSL CA Bundle set to: {certifi.where()}")
+
+# Optional: Disable SSL verification if explicitly requested (debugging only)
+if os.getenv("VERIFY_SSL", "true").lower() == "false":
+    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+    # Monkey patch requests to default verify=False
+    _original_request = requests.Session.request
+    def _new_request(self, *args, **kwargs):
+        kwargs.setdefault('verify', False)
+        return _original_request(self, *args, **kwargs)
+    requests.Session.request = _new_request
+    print("WARNING: SSL Verification is DISABLED globally!")
 
 
 # Import cache manager
